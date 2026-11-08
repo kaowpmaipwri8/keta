@@ -1,5 +1,5 @@
 --[[
-    Ketamine UI Library  v1.2.0
+    Ketamine UI Library  v1.3.0
     ------------------------------------------------------------------
     local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/YOU/REPO/main/Library.lua"))()
 
@@ -9,6 +9,9 @@
         TextSize  = 12,                       -- absolute text size (Proggy Clean)
         ToggleKey = Enum.KeyCode.RightShift,
         Preview   = true,                     -- character preview next to the window
+        AutoScale = true,                     -- keeps the menu the same size relative to any screen
+        ReferenceSize = Vector2.new(1920, 1080),   -- the resolution Scale = 1 is designed for
+        UIScale   = 1,                        -- extra multiplier on top of AutoScale
         Theme     = { Accent = Color3.fromRGB(125, 129, 172) },   -- optional overrides
     })
 
@@ -26,7 +29,8 @@
         :AddDropdown    { Text, Flag, Options, Default, Callback }       -> :SetOptions(list)
         :AddListBox     { Text, Flag, Items, Rows, Default, Callback }   -> :SetItems(list)
         :AddInput       { Text, Flag, Default, Placeholder, Callback(text, enterPressed) }
-        :AddKeybind     { Text, Flag, Default (KeyCode), Callback, Changed(key) }
+        :AddKeybind     { Text, Flag, Default (KeyCode), Callback, Changed(key), Mode }
+                        Mode = "Toggle" | "Hold" | "Always"  ->  Callback(state); no Mode -> Callback() on press
         :AddColorPicker { Text, Flag, Default (Color3), Callback }
         :AddButton      { Text, Callback }
         :AddButtonRow   { {Text, Callback}, {Text, Callback}, ... }      -- buttons side by side
@@ -42,11 +46,12 @@
         Library:SetTheme(name, Color3)   Library:GetTheme(name)   (Accent, Background, Panel, Field, Text, Outline)
         Library:SaveConfig(n) :LoadConfig(n) :DeleteConfig(n) :ListConfigs()
         Library:SetAutoload(n) :LoadAutoload()
+        Library:Notify(text, seconds, color)   Library:Watermark(text)   Library:KeybindList()
         Library:OnUnload(fn)  Library:Unload()
         Window:SetVisible(b)  Window:Toggle()  Window:Destroy()
 ]]
 
-local Library = { Flags = {}, Options = {}, Version = "1.2.0", ConfigFolder = "Ketamine/Configs" }
+local Library = { Flags = {}, Options = {}, Version = "1.3.0", ConfigFolder = "Ketamine/Configs" }
 local Flags, Options = Library.Flags, Library.Options
 
 -- ============================================================
@@ -76,6 +81,9 @@ local Conns = {}                       -- service connections, disconnected on U
 local function track(c) Conns[#Conns + 1] = c; return c end
 
 local UnloadCallbacks = {}
+local KeyRegistry = {}                 -- keybinds with a Mode (shown by Library:KeybindList)
+local Scalers = {}                     -- UIScale objects that follow the screen resolution
+local NotifyHolder = nil
 local Screen, WindowObj = nil, nil
 local isListening = false              -- a keybind is waiting for a key
 
@@ -285,14 +293,13 @@ end
 
 local function calibrate(obj, input)
     local inset = GuiService:GetGuiInset().Y
-    if inset <= 0 or obj.AbsoluteSize.Y >= inset then return end
+    if inset <= 0 then return end
     local _, y = rawPointer(input)
     local top, bottom = obj.AbsolutePosition.Y, obj.AbsolutePosition.Y + obj.AbsoluteSize.Y
-    if y >= top and y <= bottom then
-        MouseDY = 0
-    elseif y - inset >= top and y - inset <= bottom then
-        MouseDY = inset
-    end
+    local plain   = (y >= top and y <= bottom)
+    local shifted = (y - inset >= top and y - inset <= bottom)
+    if plain and not shifted then MouseDY = 0
+    elseif shifted and not plain then MouseDY = inset end
 end
 
 -- dark 1px-outlined box. bgKey: theme key for the fill (default "BoxOff"), false = widget handles it
@@ -756,7 +763,6 @@ local function buildInput(parent, o)
         TextXAlignment = Enum.TextXAlignment.Left,
     }, box)
     textStroke(tb)
-    new("UIPadding", { PaddingBottom = UDim.new(0, -TEXT_Y * 2) }, tb)
     bindKey(tb, "TextColor3", "Text")
 
     Flags[flag] = tb.Text
@@ -782,6 +788,8 @@ local function buildKeybind(parent, o)
     local flag = o.Flag or o.Text
     local key = o.Default or Enum.KeyCode.Unknown
     local listening = false
+    local mode = o.Mode                       -- nil | "Toggle" | "Hold" | "Always"
+    local toggled = (mode == "Always")
 
     label(parent, o.Text, o.X, o.Y, o.W - 90, 15)
     local b = new("TextButton", {
@@ -795,6 +803,18 @@ local function buildKeybind(parent, o)
     end
     Flags[flag] = key.Name
     show()
+
+    if mode then
+        KeyRegistry[#KeyRegistry + 1] = {
+            name = o.Text, mode = mode,
+            key = function() return key end,
+            state = function() return toggled end,
+        }
+    end
+
+    local function fire()
+        if o.Callback then pcall(o.Callback, toggled) end
+    end
 
     local blockedPress = false
     b.MouseButton1Down:Connect(function() blockedPress = Active ~= nil end)
@@ -816,13 +836,28 @@ local function buildKeybind(parent, o)
             end
             return
         end
-        if not gp and key ~= Enum.KeyCode.Unknown and input.KeyCode == key and o.Callback then
-            pcall(o.Callback)
+        if gp or key == Enum.KeyCode.Unknown or input.KeyCode ~= key then return end
+        if mode == nil then
+            if o.Callback then pcall(o.Callback) end
+        elseif mode == "Toggle" then
+            toggled = not toggled
+            fire()
+        elseif mode == "Hold" then
+            toggled = true
+            fire()
+        end
+    end))
+
+    track(UserInputService.InputEnded:Connect(function(input)
+        if mode == "Hold" and toggled and input.KeyCode == key then
+            toggled = false
+            fire()
         end
     end))
 
     return register(flag, {
         Get = function() return key end,
+        State = function() return toggled end,
         Set = function(_, v)
             if typeof(v) == "string" then v = Enum.KeyCode[v] or Enum.KeyCode.Unknown end
             key = v
@@ -1056,7 +1091,7 @@ local function placed(self, kind, height, o)
     o = o or {}
     local gap = 0
     if self.Last then
-        gap = (self.Last == "toggle" and kind == "toggle") and 0 or WIDGET_GAP
+        gap = (self.Last == "toggle" and kind == "toggle") and 0 or (self.Gap or WIDGET_GAP)
     end
     local y = self.Y + gap
     self.Y = y + height
@@ -1084,9 +1119,9 @@ function Container:AddListBox(o)
 end
 
 -- several buttons side by side: AddButtonRow({ {Text=, Callback=}, {Text=, Callback=} })
-function Container:AddButtonRow(list)
+function Container:AddButtonRow(list, hgap)
     local p = placed(self, "button", 15, {})
-    local n, gap = #list, 4
+    local n, gap = #list, hgap or 4
     local bw = (p.W - gap * (n - 1)) / n
     local out = {}
     for i, def in ipairs(list) do
@@ -1132,11 +1167,12 @@ function Container:AddThemePickers(names)
 end
 
 function Container:AddConfigSystem()
+    local oldGap = self.Gap
+    self.Gap = 3                                            -- compact block: tight vertical gaps
     local nameInput = self:AddInput({ Text = "Config Name", Flag = "__cfg_name", Placeholder = "Type a name..." })
-    local list = self:AddListBox({ Text = "Configs", Flag = "__cfg_list", Items = Library:ListConfigs(), Rows = 5 })
-    local status
+    local list = self:AddListBox({ Text = "Configs", Flag = "__cfg_list", Items = Library:ListConfigs(), Rows = 7 })
 
-    local function say(msg) if status then status:SetText(msg) end end
+    local function say(msg) Library:Notify(msg, 3) end
     local function refresh(select)
         list:SetItems(Library:ListConfigs())
         if select then list:Set(select) end
@@ -1157,7 +1193,7 @@ function Container:AddConfigSystem()
             local n = selected(); if not n then return end
             say(Library:LoadConfig(n) and ("Loaded " .. n) or "Could not load")
         end },
-    })
+    }, 3)
     self:AddButtonRow({
         { Text = "Overwrite", Callback = function()
             local n = selected(); if not n then return end
@@ -1167,15 +1203,15 @@ function Container:AddConfigSystem()
             local n = selected(); if not n then return end
             if Library:DeleteConfig(n) then refresh(); say("Deleted " .. n) else say("Could not delete") end
         end },
-    })
+    }, 3)
     self:AddButtonRow({
         { Text = "Refresh", Callback = function() refresh(list:Get()); say("Refreshed") end },
         { Text = "Set Autoload", Callback = function()
             local n = selected(); if not n then return end
             say(Library:SetAutoload(n) and ("Autoload: " .. n) or "Could not set autoload")
         end },
-    })
-    status = self:AddLabel("")
+    }, 3)
+    self.Gap = oldGap
     return { Input = nameInput, List = list, Refresh = refresh }
 end
 
@@ -1305,11 +1341,39 @@ local function buildPreview(root)
     local cam = new("Camera", { FieldOfView = CAM_FOV }, viewport)
     viewport.CurrentCamera = cam
 
+    -- Framing uses the BODY only (direct child parts: head, torso, limbs). Accessories, tools,
+    -- an expanded HumanoidRootPart or odd avatar scales therefore never change the preview size.
+    local function bodyBox(model)
+        local mn, mx
+        for _, d in ipairs(model:GetChildren()) do
+            if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" then
+                local h = d.Size / 2
+                for _, sx in ipairs({ -1, 1 }) do
+                    for _, sy in ipairs({ -1, 1 }) do
+                        for _, sz in ipairs({ -1, 1 }) do
+                            local p = d.CFrame:PointToWorldSpace(Vector3.new(h.X * sx, h.Y * sy, h.Z * sz))
+                            mn = mn and mn:Min(p) or p
+                            mx = mx and mx:Max(p) or p
+                        end
+                    end
+                end
+            end
+        end
+        if not mn then
+            local cf, size = model:GetBoundingBox()
+            return cf.Position, size
+        end
+        return (mn + mx) / 2, mx - mn
+    end
+
     local rig, rigToken = nil, 0
+    local rigCenter, rigSize = nil, nil
+
     local function buildRig()
         rigToken += 1
         local token = rigToken
         if rig then rig:Destroy(); rig = nil end
+        rigCenter, rigSize = nil, nil
 
         local char = LocalPlayer.Character
         if not char then return end
@@ -1336,26 +1400,213 @@ local function buildPreview(root)
         clone.PrimaryPart = clone:FindFirstChild("HumanoidRootPart") or clone.PrimaryPart
         if not clone.PrimaryPart then clone:Destroy(); return end
         clone.Parent = viewport
+        clone:PivotTo(CFrame.new(RIG_POS) * CFrame.Angles(0, math.rad(facing), 0))
         rig = clone
+        rigCenter, rigSize = bodyBox(clone)
     end
 
     task.spawn(buildRig)
     track(LocalPlayer.CharacterAdded:Connect(function() task.spawn(buildRig) end))
     track(RunService.RenderStepped:Connect(function()
-        if not root.Visible then return end
-        if rig and rig.PrimaryPart then
-            rig:SetPrimaryPartCFrame(CFrame.new(RIG_POS) * CFrame.Angles(0, math.rad(facing), 0))
-            local boxCF, size = rig:GetBoundingBox()
-            local center = boxCF.Position
-            local aspect = math.max(viewport.AbsoluteSize.X, 1) / math.max(viewport.AbsoluteSize.Y, 1)
-            local tanHalf = math.tan(math.rad(CAM_FOV / 2))
-            local distY = (size.Y / 2) / tanHalf
-            local distX = (math.max(size.X, size.Z) / 2) / (tanHalf * aspect)
-            local dist = math.max(distY, distX) * FIT + size.Z / 2
-            cam.CFrame = CFrame.lookAt(center + Vector3.new(0, 0, dist), center)
-        end
+        if not root.Visible or not rigCenter then return end
+        local aspect = math.max(viewport.AbsoluteSize.X, 1) / math.max(viewport.AbsoluteSize.Y, 1)
+        local tanHalf = math.tan(math.rad(CAM_FOV / 2))
+        local distY = (rigSize.Y / 2) / tanHalf
+        local distX = (rigSize.X / 2) / (tanHalf * aspect)
+        local dist = math.max(distY, distX) * FIT + rigSize.Z / 2
+        cam.CFrame = CFrame.lookAt(rigCenter + Vector3.new(0, 0, dist), rigCenter)
     end))
     return preview
+end
+
+-- ------------------------------------------------------------
+-- Resolution independence: one UIScale per top-level frame, driven by the screen size
+-- ------------------------------------------------------------
+local REF_SIZE = Vector2.new(1920, 1080)
+
+local function currentViewport()
+    local cam = workspace.CurrentCamera
+    return cam and cam.ViewportSize or REF_SIZE
+end
+
+local function autoScaleFactor()
+    local mult = Library.UIScaleMultiplier or 1
+    if Library.AutoScale == false then return mult end
+    local vp, ref = currentViewport(), Library.ReferenceSize or REF_SIZE
+    return math.clamp(math.min(vp.X / ref.X, vp.Y / ref.Y), 0.5, 3) * mult
+end
+
+local function addScaler(frame)
+    local u = new("UIScale", { Scale = autoScaleFactor() }, frame)
+    Scalers[#Scalers + 1] = u
+    return u
+end
+
+local function updateScalers()
+    local f = autoScaleFactor()
+    for _, u in ipairs(Scalers) do u.Scale = f end
+end
+
+-- dragging in screen-scale units, so it works at any UIScale / resolution
+local function makeDraggable(frame, handle, onPress)
+    local dragging, dragStart, startPos = false, nil, nil
+    handle.InputBegan:Connect(function(input)
+        if isPress(input) then
+            if onPress then onPress(handle, input) end
+            dragging, dragStart, startPos = true, input.Position, frame.Position
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local vp = Screen and Screen.AbsoluteSize or currentViewport()
+            local d = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale + d.X / math.max(vp.X, 1), startPos.X.Offset,
+                startPos.Y.Scale + d.Y / math.max(vp.Y, 1), startPos.Y.Offset)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if isPress(input) then dragging = false end
+    end))
+end
+
+local function rgbString(c)
+    return string.format("rgb(%d,%d,%d)", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+-- ------------------------------------------------------------
+-- Notifications
+-- ------------------------------------------------------------
+function Library:Notify(text, duration, color)
+    if not Screen then return end
+    if not (NotifyHolder and NotifyHolder.Parent) then
+        NotifyHolder = new("Frame", {
+            Name = "Notifications", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -24),
+            Size = UDim2.new(0, 320, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+        }, Screen)
+        new("UIListLayout", {
+            Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
+            HorizontalAlignment = Enum.HorizontalAlignment.Center, VerticalAlignment = Enum.VerticalAlignment.Bottom,
+        }, NotifyHolder)
+        addScaler(NotifyHolder)
+    end
+
+    local item = new("CanvasGroup", {
+        Size = UDim2.new(0, 0, 0, 20), AutomaticSize = Enum.AutomaticSize.X,
+        BorderSizePixel = 0, GroupTransparency = 1,
+    }, NotifyHolder)
+    bindKey(item, "BackgroundColor3", "BoxOff")
+    stroke(item, "Border")
+
+    local bar = new("Frame", { Size = UDim2.new(0, 2, 1, 0), BorderSizePixel = 0, ZIndex = 2 }, item)
+    if color then bar.BackgroundColor3 = color else bindKey(bar, "BackgroundColor3", "Accent") end
+
+    local lbl = new("TextLabel", {
+        Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1,
+        FontFace = Font_Main, Text = text, TextSize = TEXT_SIZE, TextColor3 = C.Text,
+        Position = UDim2.new(0, 0, 0, TEXT_Y),
+    }, item)
+    textStroke(lbl)
+    bindKey(lbl, "TextColor3", "Text")
+    new("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 8) }, lbl)
+
+    tween(item, { GroupTransparency = 0 }, 0.15)
+    task.delay(duration or 3, function()
+        if item and item.Parent then
+            tween(item, { GroupTransparency = 1 }, 0.25)
+            task.delay(0.3, function() if item and item.Parent then item:Destroy() end end)
+        end
+    end)
+end
+
+-- ------------------------------------------------------------
+-- Watermark
+-- ------------------------------------------------------------
+function Library:Watermark(text, visible)
+    if not Screen then return end
+    local f = new("Frame", {
+        Name = "Watermark", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 16),
+        Size = UDim2.new(0, 0, 0, 20), AutomaticSize = Enum.AutomaticSize.X, BorderSizePixel = 0,
+        Visible = visible ~= false,
+    }, Screen)
+    bindKey(f, "BackgroundColor3", "BoxOff")
+    stroke(f, "Border")
+    addScaler(f)
+
+    local lbl = new("TextLabel", {
+        Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1,
+        FontFace = Font_Main, Text = text or "", TextSize = TEXT_SIZE, TextColor3 = C.Text,
+        Position = UDim2.new(0, 0, 0, TEXT_Y + 1),
+    }, f)
+    textStroke(lbl)
+    bindKey(lbl, "TextColor3", "Text")
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, lbl)
+
+    local line = new("Frame", { Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, ZIndex = 2 }, f)
+    bindKey(line, "BackgroundColor3", "Accent")
+    makeDraggable(f, f)
+
+    return {
+        SetText = function(_, v) lbl.Text = v end,
+        SetVisibility = function(_, v) f.Visible = v and true or false end,
+    }
+end
+
+-- ------------------------------------------------------------
+-- Keybind list (shows every keybind that has a Mode; active ones use the accent colour)
+-- ------------------------------------------------------------
+function Library:KeybindList(visible)
+    if not Screen then return end
+    local f = new("Frame", {
+        Name = "KeybindList", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 16, 0.5, 0),
+        Size = UDim2.new(0, 110, 0, 0), AutomaticSize = Enum.AutomaticSize.XY, BorderSizePixel = 0,
+        Visible = visible ~= false,
+    }, Screen)
+    bindKey(f, "BackgroundColor3", "BoxOff")
+    stroke(f, "Border")
+    addScaler(f)
+    new("UIPadding", {
+        PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7), PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 5),
+    }, f)
+
+    local line = new("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 0, -4), BorderSizePixel = 0, ZIndex = 2 }, f)
+    bindKey(line, "BackgroundColor3", "Accent")
+
+    local title = new("TextLabel", {
+        Size = UDim2.new(0, 96, 0, 14), BackgroundTransparency = 1, FontFace = Font_Main, Text = "Keybinds",
+        TextSize = TEXT_SIZE, TextColor3 = C.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        Position = UDim2.new(0, 0, 0, TEXT_Y),
+    }, f)
+    textStroke(title)
+    bindKey(title, "TextColor3", "Text")
+
+    local list = new("TextLabel", {
+        Size = UDim2.new(0, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.XY, BackgroundTransparency = 1,
+        FontFace = Font_Main, Text = "", TextSize = TEXT_SIZE, TextColor3 = C.Text, RichText = true,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+        Position = UDim2.new(0, 0, 0, 16),
+    }, f)
+    textStroke(list)
+    makeDraggable(f, f)
+
+    local acc = 0
+    track(RunService.Heartbeat:Connect(function(dt)
+        acc += dt
+        if acc < 0.1 or not f.Visible then return end
+        acc = 0
+        local lines = {}
+        for _, e in ipairs(KeyRegistry) do
+            local k = e.key()
+            local keyName = (k == Enum.KeyCode.Unknown) and "None" or k.Name
+            local on = e.state()
+            lines[#lines + 1] = string.format('<font color="%s">[%s] %s - %s</font>',
+                rgbString(on and C.Accent or C.Text), e.mode, e.name, keyName)
+        end
+        list.Text = table.concat(lines, "\n")
+    end))
+
+    return { SetVisibility = function(_, v) f.Visible = v and true or false end }
 end
 
 -- ------------------------------------------------------------
@@ -1367,6 +1618,9 @@ function Library:CreateWindow(cfg)
 
     SCALE     = cfg.Scale or 1
     TEXT_SIZE = cfg.TextSize or 12          -- absolute: the pixel font is not scaled
+    Library.AutoScale        = cfg.AutoScale
+    Library.ReferenceSize    = cfg.ReferenceSize
+    Library.UIScaleMultiplier = cfg.UIScale
     resetTheme(cfg.Theme or (cfg.Accent and { Accent = cfg.Accent }) or nil)
 
     local existing = GuiParent:FindFirstChild(GUI_NAME)
@@ -1381,9 +1635,17 @@ function Library:CreateWindow(cfg)
     local W, H = s(WIN_W), s(WIN_H)
     local root = new("Frame", {
         Name = "Window", Size = UDim2.new(0, W, 0, H),
-        Position = UDim2.new(0.5, -W / 2, 0.5, -H / 2),
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
         BackgroundColor3 = WHITE, BorderSizePixel = 0,
     }, Screen)
+    addScaler(root)
+    do   -- follow resolution / window-size changes
+        local lastVp = currentViewport()
+        track(RunService.Heartbeat:Connect(function()
+            local vp = currentViewport()
+            if vp ~= lastVp then lastVp = vp; updateScalers() end
+        end))
+    end
     gradient(root, "WinTop", "WinBot")
     stroke(root, "Border")
 
@@ -1424,27 +1686,10 @@ function Library:CreateWindow(cfg)
 
     -- dragging (title bar)
     do
-        local dragging, dragStart, startPos = false, nil, nil
         local dragArea = new("TextButton", {
             Size = UDim2.new(1, 0, 0, s(22)), BackgroundTransparency = 1, Text = "", ZIndex = 10,
         }, root)
-        dragArea.InputBegan:Connect(function(input)
-            if isPress(input) then
-                calibrate(dragArea, input)
-                dragging, dragStart, startPos = true, input.Position, root.Position
-            end
-        end)
-        track(UserInputService.InputChanged:Connect(function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-                or input.UserInputType == Enum.UserInputType.Touch) then
-                local d = input.Position - dragStart
-                root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
-            end
-        end))
-        track(UserInputService.InputEnded:Connect(function(input)
-            if isPress(input) then dragging = false end
-        end))
+        makeDraggable(root, dragArea, calibrate)
     end
 
     -- toggle key
@@ -1470,6 +1715,9 @@ function Library:Unload()
     for _, c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
     table.clear(Conns)
     table.clear(Binds)
+    table.clear(KeyRegistry)
+    table.clear(Scalers)
+    NotifyHolder = nil
     if Screen then pcall(function() Screen:Destroy() end) end
     Screen, WindowObj, isListening = nil, nil, false
     table.clear(Options)
